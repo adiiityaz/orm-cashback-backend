@@ -2,7 +2,10 @@ from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 from .models import Review
-from payments.models import Wallet, Transaction
+from api.services.wallet_service import WalletService
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @receiver(pre_save, sender=Review)
@@ -33,42 +36,26 @@ def review_post_save(sender, instance, created, **kwargs):
             
             # Only process if cashback amount is greater than 0
             if instance.cashback_amount and instance.cashback_amount > 0:
-                try:
-                    # Add cashback to wallet
-                    wallet.balance += instance.cashback_amount
-                    wallet.total_earned += instance.cashback_amount
-                    wallet.save()
-                    
-                    # Create transaction record
-                    Transaction.objects.create(
-                        wallet=wallet,
-                        amount=instance.cashback_amount,
-                        currency=currency,
-                        transaction_type='CREDIT',
-                        status='COMPLETED',
-                        review=instance,
-                        order=instance.order,
-                        description=f"Cashback for approved review: {instance.product.name}",
-                        completed_at=timezone.now()
-                    )
-                    
+                # Use service layer for wallet operations
+                success = WalletService.credit_wallet_for_review(instance)
+                
+                if success:
                     # Update review cashback status
                     instance.cashback_status = 'PROCESSED'
                     # Use update to avoid triggering signal again
                     Review.objects.filter(pk=instance.pk).update(
                         cashback_status='PROCESSED'
                     )
-                    
-                except Exception as e:
+                    logger.info(f"Cashback processed for review {instance.id}, Amount: {instance.cashback_amount}")
+                else:
                     # Mark cashback as failed if there's an error
                     instance.cashback_status = 'FAILED'
                     Review.objects.filter(pk=instance.pk).update(
                         cashback_status='FAILED'
                     )
-                    # Log error (in production, use proper logging)
-                    print(f"Error processing cashback for review {instance.id}: {str(e)}")
+                    logger.error(f"Failed to process cashback for review {instance.id}")
         
         except Exception as e:
             # Handle any errors gracefully
-            print(f"Error in review_post_save signal for review {instance.id}: {str(e)}")
+            logger.error(f"Error in review_post_save signal for review {instance.id}: {str(e)}", exc_info=True)
 

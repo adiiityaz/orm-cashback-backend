@@ -1,7 +1,11 @@
 from django.db import models
+from django.db import transaction
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Wallet(models.Model):
@@ -55,18 +59,21 @@ class Wallet(models.Model):
         if amount <= 0:
             raise ValueError("Amount must be greater than 0")
         
-        self.balance += amount
-        if transaction_type == 'CREDIT':
-            self.total_earned += amount
-        self.save()
+        with transaction.atomic():
+            self.balance += amount
+            if transaction_type == 'CREDIT':
+                self.total_earned += amount
+            self.save()
+            
+            # Create transaction record
+            Transaction.objects.create(
+                wallet=self,
+                amount=amount,
+                transaction_type=transaction_type,
+                status='COMPLETED'
+            )
         
-        # Create transaction record
-        Transaction.objects.create(
-            wallet=self,
-            amount=amount,
-            transaction_type=transaction_type,
-            status='COMPLETED'
-        )
+        logger.info(f"Balance added to wallet {self.id}: {amount}, Type: {transaction_type}")
     
     def deduct_balance(self, amount, transaction_type='DEBIT'):
         """Deduct balance from wallet and create transaction"""
@@ -75,18 +82,21 @@ class Wallet(models.Model):
         if self.balance < amount:
             raise ValueError("Insufficient balance")
         
-        self.balance -= amount
-        if transaction_type == 'WITHDRAWAL':
-            self.total_withdrawn += amount
-        self.save()
+        with transaction.atomic():
+            self.balance -= amount
+            if transaction_type == 'WITHDRAWAL':
+                self.total_withdrawn += amount
+            self.save()
+            
+            # Create transaction record
+            Transaction.objects.create(
+                wallet=self,
+                amount=amount,
+                transaction_type=transaction_type,
+                status='COMPLETED'
+            )
         
-        # Create transaction record
-        Transaction.objects.create(
-            wallet=self,
-            amount=amount,
-            transaction_type=transaction_type,
-            status='COMPLETED'
-        )
+        logger.info(f"Balance deducted from wallet {self.id}: {amount}, Type: {transaction_type}")
 
 
 class Transaction(models.Model):

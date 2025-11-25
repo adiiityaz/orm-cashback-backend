@@ -8,12 +8,26 @@ from .serializers import UserRegistrationSerializer, UserSerializer
 from .models import User
 
 
+@ratelimit(key='ip', rate=RATE_LIMIT_REGISTER, method='POST', block=True)
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def register(request):
     """
     Register a new user (USER or BRAND role)
+    
     POST /api/auth/register/
+    
+    Request Body:
+        email: User email (required)
+        password: User password (required)
+        password2: Password confirmation (required)
+        first_name: First name (optional)
+        last_name: Last name (optional)
+        phone_number: Phone number (optional)
+        role: USER or BRAND (required)
+    
+    Returns:
+        Response: User data and JWT tokens
     """
     serializer = UserRegistrationSerializer(data=request.data)
     
@@ -23,65 +37,60 @@ def register(request):
         # Generate JWT tokens
         refresh = RefreshToken.for_user(user)
         
-        return Response({
-            'status': 'success',
-            'message': 'User registered successfully',
+        return success_response({
             'user': UserSerializer(user).data,
             'tokens': {
                 'refresh': str(refresh),
                 'access': str(refresh.access_token),
             }
-        }, status=status.HTTP_201_CREATED)
+        }, message='User registered successfully', status_code=status.HTTP_201_CREATED)
     
-    return Response({
-        'status': 'error',
-        'errors': serializer.errors
-    }, status=status.HTTP_400_BAD_REQUEST)
+    return error_response('Invalid registration data', errors=serializer.errors)
 
 
+@ratelimit(key='ip', rate=RATE_LIMIT_LOGIN, method='POST', block=True)
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login(request):
     """
     Login user and get JWT tokens
+    
     POST /api/auth/login/
+    
+    Request Body:
+        email: User email (required)
+        password: User password (required)
+    
+    Returns:
+        Response: User data and JWT tokens
     """
     email = request.data.get('email')
     password = request.data.get('password')
     
     if not email or not password:
-        return Response({
-            'status': 'error',
-            'message': 'Email and password are required'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return error_response('Email and password are required')
     
     # Authenticate user
     user = authenticate(request, username=email, password=password)
     
     if user is None:
-        return Response({
-            'status': 'error',
-            'message': 'Invalid email or password'
-        }, status=status.HTTP_401_UNAUTHORIZED)
+        return unauthorized_response('Invalid email or password')
     
     if not user.is_active:
-        return Response({
-            'status': 'error',
-            'message': 'User account is disabled'
-        }, status=status.HTTP_401_UNAUTHORIZED)
+        return unauthorized_response('User account is disabled')
     
     # Generate JWT tokens
     refresh = RefreshToken.for_user(user)
     
-    return Response({
-        'status': 'success',
-        'message': 'Login successful',
+    logger.info(f"User logged in: {user.email}")
+    
+    return success_response({
         'user': UserSerializer(user).data,
         'tokens': {
             'refresh': str(refresh),
             'access': str(refresh.access_token),
         }
-    }, status=status.HTTP_200_OK)
+    }, message='Login successful')
 
 
 @api_view(['GET'])
@@ -89,10 +98,13 @@ def login(request):
 def get_current_user(request):
     """
     Get current logged-in user details
+    
     GET /api/auth/me/
+    
+    Returns:
+        Response: Current user data
     """
     serializer = UserSerializer(request.user)
-    return Response({
-        'status': 'success',
+    return success_response({
         'user': serializer.data
-    }, status=status.HTTP_200_OK)
+    })

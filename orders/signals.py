@@ -2,6 +2,9 @@ from django.db.models.signals import pre_save, post_save
 from django.dispatch import receiver
 from django.utils import timezone
 from .models import Order
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @receiver(pre_save, sender=Order)
@@ -24,6 +27,7 @@ def order_post_save(sender, instance, created, **kwargs):
     if instance.status in ['REJECTED', 'CANCELLED'] and instance.review_slot:
         try:
             instance.review_slot.release_slot()
+            logger.info(f"Review slot released for order {instance.id}")
         except Exception as e:
-            print(f"Error releasing review slot for order {instance.id}: {str(e)}")
+            logger.error(f"Error releasing review slot for order {instance.id}: {str(e)}", exc_info=True)
 

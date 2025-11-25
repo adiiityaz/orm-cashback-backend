@@ -1,7 +1,7 @@
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 from django.db.models import Q
 from marketplace.models import Product, ReviewSlot
@@ -12,6 +12,22 @@ from .serializers import (
     ProductSerializer, ReviewSlotSerializer, OrderCreateSerializer, 
     OrderSerializer, ReviewCreateSerializer, ReviewSerializer, WalletSerializer
 )
+from .utils import (
+    success_response, error_response, forbidden_response,
+    StandardResultsSetPagination
+)
+from .constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, RECENT_TRANSACTIONS_LIMIT
+from .services.product_service import ProductService
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class StandardResultsSetPagination(PageNumberPagination):
+    """Pagination class for user endpoints"""
+    page_size = DEFAULT_PAGE_SIZE
+    page_size_query_param = 'page_size'
+    max_page_size = MAX_PAGE_SIZE
 
 
 @api_view(['GET'])
@@ -19,43 +35,34 @@ from .serializers import (
 def shop_products(request):
     """
     Get list of products available for reviews
+    
     GET /api/shop/products/
+    
+    Returns:
+        Response: List of available products with pagination
     """
-    # Only show active products with available review slots
-    products = Product.objects.filter(
-        is_active=True
-    ).prefetch_related('review_slots').distinct()
+    if not request.user.is_user:
+        return forbidden_response('Only users with USER role can access this endpoint.')
     
-    # Filter products that have at least one open review slot
-    products_with_slots = []
-    user = request.user
-    
-    for product in products:
-        if product.review_slots.filter(status='OPEN').exists():
-            # Filter out products user has already completed
-            completed_orders = Order.objects.filter(
-                user=user,
-                product=product,
-                status='APPROVED'
-            )
-            # Check if user has submitted a review for any approved order
-            has_completed = Review.objects.filter(
-                user=user,
-                product=product,
-                order__in=completed_orders,
-                status='APPROVED'
-            ).exists()
-            
-            if not has_completed:
-                products_with_slots.append(product)
-    
-    serializer = ProductSerializer(products_with_slots, many=True, context={'request': request})
-    
-    return Response({
-        'status': 'success',
-        'count': len(products_with_slots),
-        'products': serializer.data
-    }, status=status.HTTP_200_OK)
+    try:
+        # Use service layer for business logic
+        products = ProductService.get_available_products_for_user(request.user)
+        
+        # Filter by platform if provided
+        platform = request.GET.get('platform')
+        if platform and platform in ['AMAZON', 'FLIPKART', 'SHOPIFY', 'OTHER']:
+            products = [p for p in products if p.review_platform == platform]
+        
+        serializer = ProductSerializer(products, many=True, context={'request': request})
+        
+        return success_response({
+            'count': len(products),
+            'products': serializer.data,
+            'platform_filter': platform if platform else None
+        })
+    except Exception as e:
+        logger.error(f"Error fetching shop products: {str(e)}", exc_info=True)
+        return error_response('Failed to fetch products', status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['POST'])
@@ -66,27 +73,18 @@ def track_click(request):
     POST /api/user/track/
     """
     if not request.user.is_user:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with USER role can track clicks.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with USER role can track clicks.')
     
     product_id = request.data.get('product_id')
     review_slot_id = request.data.get('review_slot_id')
     
     if not product_id:
-        return Response({
-            'status': 'error',
-            'message': 'Product ID is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return error_response('Product ID is required')
     
     try:
         product = Product.objects.get(id=product_id, is_active=True)
     except Product.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Product not found'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return error_response('Product not found', status_code=status.HTTP_404_NOT_FOUND)
     
     review_slot = None
     if review_slot_id:
@@ -97,10 +95,7 @@ def track_click(request):
                 status='OPEN'
             )
         except ReviewSlot.DoesNotExist:
-            return Response({
-                'status': 'error',
-                'message': 'Review slot not found or not available'
-            }, status=status.HTTP_404_NOT_FOUND)
+            return error_response('Review slot not found or not available', status_code=status.HTTP_404_NOT_FOUND)
     
     # Create draft order
     draft_order = Order.objects.create(
@@ -119,11 +114,9 @@ def track_click(request):
     
     from .serializers import OrderSerializer
     
-    return Response({
-        'status': 'success',
-        'message': 'Click tracked. Draft order created.',
+    return success_response({
         'draft_order': OrderSerializer(draft_order, context={'request': request}).data
-    }, status=status.HTTP_201_CREATED)
+    }, message='Click tracked. Draft order created.', status_code=status.HTTP_201_CREATED)
 
 
 @api_view(['POST'])
@@ -135,10 +128,7 @@ def submit_order(request):
     """
     # Ensure user has USER role
     if not request.user.is_user:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with USER role can submit orders.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with USER role can submit orders.')
     
     serializer = OrderCreateSerializer(data=request.data, context={'request': request})
     
@@ -152,16 +142,11 @@ def submit_order(request):
         
         response_serializer = OrderSerializer(order, context={'request': request})
         
-        return Response({
-            'status': 'success',
-            'message': 'Order submitted successfully. Waiting for approval.',
+        return success_response({
             'order': response_serializer.data
-        }, status=status.HTTP_201_CREATED)
+        }, message='Order submitted successfully. Waiting for approval.', status_code=status.HTTP_201_CREATED)
     
-    return Response({
-        'status': 'error',
-        'errors': serializer.errors
-    }, status=status.HTTP_400_BAD_REQUEST)
+    return error_response('Invalid order data', errors=serializer.errors)
 
 
 @api_view(['GET'])
@@ -173,19 +158,21 @@ def user_orders(request):
     """
     # Ensure user has USER role
     if not request.user.is_user:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with USER role can view orders.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with USER role can view orders.')
     
-    orders = Order.objects.filter(user=request.user).order_by('-created_at')
-    serializer = OrderSerializer(orders, many=True, context={'request': request})
+    orders = Order.objects.filter(user=request.user).select_related(
+        'product', 'product__brand', 'review_slot'
+    ).order_by('-created_at')
     
-    return Response({
+    # Apply pagination
+    paginator = StandardResultsSetPagination()
+    paginated_orders = paginator.paginate_queryset(orders, request)
+    serializer = OrderSerializer(paginated_orders, many=True, context={'request': request}) if paginated_orders else OrderSerializer([], many=True)
+    
+    return paginator.get_paginated_response({
         'status': 'success',
-        'count': orders.count(),
         'orders': serializer.data
-    }, status=status.HTTP_200_OK)
+    })
 
 
 @api_view(['POST'])
@@ -197,10 +184,7 @@ def submit_review(request):
     """
     # Ensure user has USER role
     if not request.user.is_user:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with USER role can submit reviews.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with USER role can submit reviews.')
     
     serializer = ReviewCreateSerializer(data=request.data, context={'request': request})
     
@@ -221,16 +205,11 @@ def submit_review(request):
         
         response_serializer = ReviewSerializer(review, context={'request': request})
         
-        return Response({
-            'status': 'success',
-            'message': 'Review submitted successfully. Waiting for approval.',
+        return success_response({
             'review': response_serializer.data
-        }, status=status.HTTP_201_CREATED)
+        }, message='Review submitted successfully. Waiting for approval.', status_code=status.HTTP_201_CREATED)
     
-    return Response({
-        'status': 'error',
-        'errors': serializer.errors
-    }, status=status.HTTP_400_BAD_REQUEST)
+    return error_response('Invalid review data', errors=serializer.errors)
 
 
 @api_view(['GET'])
@@ -242,19 +221,21 @@ def user_reviews(request):
     """
     # Ensure user has USER role
     if not request.user.is_user:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with USER role can view reviews.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with USER role can view reviews.')
     
-    reviews = Review.objects.filter(user=request.user).order_by('-created_at')
-    serializer = ReviewSerializer(reviews, many=True, context={'request': request})
+    reviews = Review.objects.filter(user=request.user).select_related(
+        'product', 'order', 'order__product'
+    ).order_by('-created_at')
     
-    return Response({
+    # Apply pagination
+    paginator = StandardResultsSetPagination()
+    paginated_reviews = paginator.paginate_queryset(reviews, request)
+    serializer = ReviewSerializer(paginated_reviews, many=True, context={'request': request}) if paginated_reviews else ReviewSerializer([], many=True)
+    
+    return paginator.get_paginated_response({
         'status': 'success',
-        'count': reviews.count(),
         'reviews': serializer.data
-    }, status=status.HTTP_200_OK)
+    })
 
 
 @api_view(['GET'])
@@ -266,20 +247,16 @@ def user_wallet(request):
     """
     # Ensure user has USER role
     if not request.user.is_user:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with USER role can view wallet.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with USER role can view wallet.')
     
     # Get or create wallet for user
     wallet, created = Wallet.objects.get_or_create(user=request.user)
     
-    # Get recent transactions (last 20)
-    transactions = wallet.transactions.all().order_by('-created_at')[:20]
+    # Get recent transactions
+    transactions = wallet.transactions.all().order_by('-created_at')[:RECENT_TRANSACTIONS_LIMIT]
     
     serializer = WalletSerializer(wallet, context={'request': request})
     
-    return Response({
-        'status': 'success',
+    return success_response({
         'wallet': serializer.data
-    }, status=status.HTTP_200_OK)
+    })

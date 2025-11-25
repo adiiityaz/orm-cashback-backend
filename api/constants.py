@@ -1,0 +1,54 @@
+"""
+Application-wide constants
+"""
+from decimal import Decimal
+
+# File Upload Limits
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']
+
+# Pagination
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
+
+# JWT Token Lifetimes (in minutes/days)
+ACCESS_TOKEN_LIFETIME_MINUTES = 60
+REFRESH_TOKEN_LIFETIME_DAYS = 7
+
+# Rate Limiting
+RATE_LIMIT_REGISTER = '5/m'  # 5 requests per minute
+RATE_LIMIT_LOGIN = '10/m'  # 10 requests per minute
+RATE_LIMIT_UPLOAD = '20/h'  # 20 requests per hour
+
+# Security Headers
+HSTS_SECONDS = 31536000  # 1 year in seconds
+
+# Transaction Limits
+RECENT_TRANSACTIONS_LIMIT = 20
+
+# Currency Defaults
+DEFAULT_CURRENCY = 'USD'
+RAZORPAY_CURRENCY = 'INR'
+
+# Status Constants (for type safety)
+ORDER_STATUS_PENDING = 'PENDING'
+ORDER_STATUS_APPROVED = 'APPROVED'
+ORDER_STATUS_REJECTED = 'REJECTED'
+ORDER_STATUS_CANCELLED = 'CANCELLED'
+
+REVIEW_STATUS_PENDING = 'PENDING'
+REVIEW_STATUS_APPROVED = 'APPROVED'
+REVIEW_STATUS_REJECTED = 'REJECTED'
+
+TRANSACTION_STATUS_PENDING = 'PENDING'
+TRANSACTION_STATUS_COMPLETED = 'COMPLETED'
+TRANSACTION_STATUS_FAILED = 'FAILED'
+TRANSACTION_STATUS_CANCELLED = 'CANCELLED'
+
+CASHBACK_STATUS_PENDING = 'PENDING'
+CASHBACK_STATUS_PROCESSED = 'PROCESSED'
+CASHBACK_STATUS_FAILED = 'FAILED'
+
+# Razorpay Configuration
+RAZORPAY_AMOUNT_DIVISOR = 100  # Razorpay amounts are in paise, divide by 100 to get rupees
+

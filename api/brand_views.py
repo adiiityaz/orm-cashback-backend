@@ -1,16 +1,26 @@
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum, Count, Q, Avg
+from django.db.models.functions import Coalesce
+from django.db import transaction
 from django.utils import timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from brands.models import Brand
 from marketplace.models import Product, ReviewSlot
 from orders.models import Order
 from reviews.models import Review
 from payments.models import Transaction
 from .serializers import ProductSerializer, ReviewSlotSerializer
+from .utils import (
+    success_response, error_response, forbidden_response,
+    not_found_response, server_error_response
+)
+from .constants import DEFAULT_CURRENCY
+from .services.campaign_service import CampaignService
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @api_view(['GET'])
@@ -21,27 +31,20 @@ def brand_products(request):
     GET /api/brand/products/
     """
     if not request.user.is_brand:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with BRAND role can access this endpoint.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with BRAND role can access this endpoint.')
     
     try:
         brand = request.user.brand_profile
     except Brand.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Brand profile not found. Please create a brand profile first.'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return not_found_response('Brand profile not found. Please create a brand profile first.')
     
-    products = Product.objects.filter(brand=brand).order_by('-created_at')
+    products = Product.objects.filter(brand=brand).select_related('brand').order_by('-created_at')
     serializer = ProductSerializer(products, many=True, context={'request': request})
     
-    return Response({
-        'status': 'success',
-        'count': products.count(),
-        'products': serializer.data
-    }, status=status.HTTP_200_OK)
+        return success_response({
+            'count': products.count(),
+            'products': serializer.data
+        })
 
 
 @api_view(['POST'])
@@ -49,36 +52,62 @@ def brand_products(request):
 def create_product(request):
     """
     Create a new product
-    POST /api/brand/products/
+    POST /api/brand/products/create/
     """
     if not request.user.is_brand:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with BRAND role can create products.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with BRAND role can create products.')
     
     try:
         brand = request.user.brand_profile
     except Brand.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Brand profile not found. Please create a brand profile first.'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return not_found_response('Brand profile not found. Please create a brand profile first.')
     
     serializer = ProductSerializer(data=request.data, context={'request': request})
     
     if serializer.is_valid():
         product = serializer.save(brand=brand)
-        return Response({
-            'status': 'success',
-            'message': 'Product created successfully',
+        return success_response({
             'product': ProductSerializer(product, context={'request': request}).data
-        }, status=status.HTTP_201_CREATED)
+        }, message='Product created successfully', status_code=status.HTTP_201_CREATED)
     
-    return Response({
-        'status': 'error',
-        'errors': serializer.errors
-    }, status=status.HTTP_400_BAD_REQUEST)
+    return error_response('Invalid product data', errors=serializer.errors)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def update_product(request, product_id):
+    """
+    Update product details
+    PATCH /api/brand/products/{id}/
+    """
+    if not request.user.is_brand:
+        return forbidden_response('Only users with BRAND role can update products.')
+    
+    try:
+        brand = request.user.brand_profile
+    except Brand.DoesNotExist:
+        return not_found_response('Brand profile not found. Please create a brand profile first.')
+    
+    try:
+        product = Product.objects.get(id=product_id, brand=brand)
+    except Product.DoesNotExist:
+        return not_found_response('Product not found or does not belong to your brand')
+    
+    serializer = ProductSerializer(
+        product, 
+        data=request.data, 
+        partial=True, 
+        context={'request': request}
+    )
+    
+    if serializer.is_valid():
+        serializer.save()
+        logger.info(f"Product {product.id} updated by brand {brand.id}")
+        return success_response({
+            'product': serializer.data
+        }, message='Product updated successfully')
+    
+    return error_response('Invalid product data', errors=serializer.errors)
 
 
 @api_view(['POST'])
@@ -89,69 +118,62 @@ def create_campaign(request):
     POST /api/brand/review-slots/
     """
     if not request.user.is_brand:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with BRAND role can create campaigns.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with BRAND role can create campaigns.')
     
     try:
         brand = request.user.brand_profile
     except Brand.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Brand profile not found. Please create a brand profile first.'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return not_found_response('Brand profile not found. Please create a brand profile first.')
     
     # Get product ID
     product_id = request.data.get('product')
     if not product_id:
-        return Response({
-            'status': 'error',
-            'message': 'Product ID is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return error_response('Product ID is required')
     
     try:
         product = Product.objects.get(id=product_id, brand=brand)
     except Product.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Product not found or does not belong to your brand'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return not_found_response('Product not found or does not belong to your brand')
     
-    # Calculate total cost
-    cashback_amount = Decimal(str(request.data.get('cashback_amount', 0)))
-    total_slots = int(request.data.get('total_slots', 1))
-    total_cost = cashback_amount * total_slots
+    # Validate campaign data using service layer
+    try:
+        cashback_amount = Decimal(str(request.data.get('cashback_amount', 0)))
+        total_slots = int(request.data.get('total_slots', 1))
+        
+        is_valid, error_msg, total_cost = CampaignService.validate_campaign_data(
+            cashback_amount, total_slots, brand
+        )
+        
+        if not is_valid:
+            return error_response(error_msg)
+        
+    except (ValueError, InvalidOperation, TypeError) as e:
+        logger.error(f"Invalid input in create_campaign: {str(e)}")
+        return error_response('Invalid input data')
     
-    # Check if brand has enough balance
-    available_balance = brand.wallet_balance - brand.locked_balance
-    if available_balance < total_cost:
-        return Response({
-            'status': 'error',
-            'message': f'Insufficient balance. Required: {total_cost}, Available: {available_balance}'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Create review slot
+    # Create review slot with transaction using service layer
     serializer = ReviewSlotSerializer(data=request.data, context={'request': request})
     
     if serializer.is_valid():
-        review_slot = serializer.save(product=product)
-        
-        # Lock the balance
-        brand.locked_balance += total_cost
-        brand.save()
-        
-        return Response({
-            'status': 'success',
-            'message': 'Campaign created successfully',
-            'campaign': ReviewSlotSerializer(review_slot, context={'request': request}).data,
-            'locked_balance': str(brand.locked_balance)
-        }, status=status.HTTP_201_CREATED)
+        try:
+            campaign_data = serializer.validated_data
+            review_slot = CampaignService.create_campaign(
+                product=product,
+                brand=brand,
+                cashback_amount=cashback_amount,
+                total_slots=total_slots,
+                **campaign_data
+            )
+            
+            return success_response({
+                'campaign': ReviewSlotSerializer(review_slot, context={'request': request}).data,
+                'locked_balance': str(brand.locked_balance)
+            }, message='Campaign created successfully', status_code=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.error(f"Error creating campaign: {str(e)}", exc_info=True)
+            return server_error_response('Failed to create campaign')
     
-    return Response({
-        'status': 'error',
-        'errors': serializer.errors
-    }, status=status.HTTP_400_BAD_REQUEST)
+    return error_response('Invalid campaign data', errors=serializer.errors)
 
 
 @api_view(['GET'])
@@ -162,18 +184,12 @@ def brand_stats(request):
     GET /api/brand/stats/
     """
     if not request.user.is_brand:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with BRAND role can access this endpoint.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with BRAND role can access this endpoint.')
     
     try:
         brand = request.user.brand_profile
     except Brand.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Brand profile not found.'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return not_found_response('Brand profile not found.')
     
     # Get all products for this brand
     products = Product.objects.filter(brand=brand)
@@ -200,6 +216,23 @@ def brand_stats(request):
     total_reviews = reviews.count()
     approved_reviews = reviews.filter(status='APPROVED').count()
     
+    # Calculate sentiment breakdown (only for approved reviews)
+    approved_reviews_queryset = reviews.filter(status='APPROVED')
+    positive_reviews = approved_reviews_queryset.filter(rating__gte=4).count()
+    neutral_reviews = approved_reviews_queryset.filter(rating=3).count()
+    negative_reviews = approved_reviews_queryset.filter(rating__lte=2).count()
+    
+    # Calculate average rating
+    rating_agg = approved_reviews_queryset.aggregate(
+        avg_rating=Avg('rating')
+    )
+    avg_rating = rating_agg['avg_rating'] if rating_agg['avg_rating'] else 0
+    
+    # Reviews by rating breakdown
+    reviews_by_rating = {}
+    for rating in range(1, 6):
+        reviews_by_rating[str(rating)] = approved_reviews_queryset.filter(rating=rating).count()
+    
     # Calculate total spent (from locked balance + completed campaigns)
     total_spent = brand.locked_balance + Transaction.objects.filter(
         order__product__brand=brand,
@@ -207,8 +240,7 @@ def brand_stats(request):
         status='COMPLETED'
     ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
     
-    return Response({
-        'status': 'success',
+    return success_response({
         'stats': {
             'wallet_balance': str(brand.wallet_balance),
             'locked_balance': str(brand.locked_balance),
@@ -226,8 +258,15 @@ def brand_stats(request):
             'approved_reviews': approved_reviews,
             'reviews_acquired': approved_reviews,
             'total_spent': str(total_spent),
+            'sentiment_breakdown': {
+                'positive_reviews': positive_reviews,
+                'neutral_reviews': neutral_reviews,
+                'negative_reviews': negative_reviews,
+                'average_rating': round(float(avg_rating), 2) if avg_rating else 0
+            },
+            'reviews_by_rating': reviews_by_rating
         }
-    }, status=status.HTTP_200_OK)
+    })
 
 
 @api_view(['POST'])
@@ -238,25 +277,16 @@ def add_funds(request):
     POST /api/brand/add-funds/
     """
     if not request.user.is_brand:
-        return Response({
-            'status': 'error',
-            'message': 'Only users with BRAND role can add funds.'
-        }, status=status.HTTP_403_FORBIDDEN)
+        return forbidden_response('Only users with BRAND role can add funds.')
     
     amount = request.data.get('amount')
     if not amount or Decimal(str(amount)) <= 0:
-        return Response({
-            'status': 'error',
-            'message': 'Valid amount is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return error_response('Valid amount is required')
     
     try:
         brand = request.user.brand_profile
     except Brand.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Brand profile not found.'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return not_found_response('Brand profile not found.')
     
     # In production, integrate with Razorpay here
     # For now, return a mock order ID
@@ -272,12 +302,9 @@ def add_funds(request):
     #     }
     # })
     
-    return Response({
-        'status': 'success',
-        'message': 'Payment order created',
+    return success_response({
         'order_id': order_id,
         'amount': str(amount),
         'razorpay_key_id': getattr(settings, 'RAZORPAY_KEY_ID', ''),
-        'note': 'In production, this will integrate with Razorpay. Webhook will update wallet balance.'
-    }, status=status.HTTP_200_OK)
+    }, message='Payment order created')
 

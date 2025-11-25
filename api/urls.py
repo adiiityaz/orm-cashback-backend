@@ -27,6 +27,7 @@ urlpatterns = [
     # Brand endpoints
     path('brand/products/', brand_views.brand_products, name='brand_products'),
     path('brand/products/create/', brand_views.create_product, name='create_product'),
+    path('brand/products/<int:product_id>/', brand_views.update_product, name='update_product'),
     path('brand/review-slots/', brand_views.create_campaign, name='create_campaign'),
     path('brand/stats/', brand_views.brand_stats, name='brand_stats'),
     path('brand/add-funds/', brand_views.add_funds, name='add_funds'),
